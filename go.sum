@@ -1271,6 +1271,7 @@ k8s.io/apimachinery v0.19.0 h1:gjKnAda/HZp5k4xQYjL0K/Yb66IvNqjthCb03QlKpaQ=
 k8s.io/apimachinery v0.19.0/go.mod h1:DnPGDnARWFvYa3pMHgSxtbZb7gpzzAZ1pTfaUNDVlmA=
 k8s.io/apimachinery v0.19.1 h1:cwsxZazM/LA9aUsBaL4bRS5ygoM6bYp8dFk22DSYQa4=
 k8s.io/apimachinery v0.19.1/go.mod h1:DnPGDnARWFvYa3pMHgSxtbZb7gpzzAZ1pTfaUNDVlmA=
+k8s.io/apimachinery v0.19.2 h1:5Gy9vQpAGTKHPVOh5c4plE274X8D/6cuEiTO2zve7tc=
 k8s.io/apiserver v0.18.0/go.mod h1:3S2O6FeBBd6XTo0njUrLxiqk8GNy6wWOftjhJcXYnjw=
 k8s.io/apiserver v0.18.2/go.mod h1:Xbh066NqrZO8cbsoenCwyDJ1OSi8Ag8I2lezeHxzwzw=
 k8s.io/apiserver v0.18.6/go.mod h1:Zt2XvTHuaZjBz6EFYzpp+X4hTmgWGy8AthNVnTdm3Wg=
@@ -1322,6 +1323,7 @@ k8s.io/kube-openapi v0.0.0-20200831175022-64514a1d5d59/go.mod h1:UuqjUnNftUyPE5H
 k8s.io/kubectl v0.18.0/go.mod h1:LOkWx9Z5DXMEg5KtOjHhRiC1fqJPLyCr3KtQgEolCkU=
 k8s.io/kubectl v0.19.1 h1:6HJboel+8auKqmYODpg8pd03BmusJrljHMVDzIIU8DU=
 k8s.io/kubectl v0.19.1/go.mod h1:jZM7qucrDpQu05OAoSJk0yRRHRZNydya40dILYh8ODc=
+k8s.io/kubernetes v1.19.2 h1:sEvBYVM1/H5hqejFR10u8ndreYARV3DiTrqi2AY31ok=
 k8s.io/metrics v0.18.0/go.mod h1:8aYTW18koXqjLVKL7Ds05RPMX9ipJZI3mywYvBOxXd4=
 k8s.io/metrics v0.19.1/go.mod h1:O/ONCgXDITtJuMveKEDwZSfiqHOiMZTWmyLe/p1BoAA=
 k8s.io/utils v0.0.0-20200324210504-a9aa75ae1b89 h1:d4vVOjXm687F1iLSP2q3lyPPuyvTUt3aVoBpi2DqRsU=

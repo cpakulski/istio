@@ -38,6 +38,7 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/crypto/ssh/terminal"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 
 	clientnetworking "istio.io/client-go/pkg/apis/networking/v1alpha3"
@@ -45,6 +46,7 @@ import (
 	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/security/pkg/k8s/secret"
 	"istio.io/istio/security/pkg/pki/util"
+    "istio.io/istio/istioctl/pkg/vm"
 )
 
 var (
@@ -526,6 +528,12 @@ func deriveSSHMethod() error {
 	return nil
 }
 
+
+func vmCreateNamespace(kubeClient kubernetes.Interface, namespace string) (*v1.Namespace, error) {
+    nsSpec := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+    return kubeClient.CoreV1().Namespaces().Create(context.TODO(), nsSpec, metav1.CreateOptions{})
+}
+
 func vmBootstrapCommand() *cobra.Command {
 	vmBSCommand := &cobra.Command{
 		Use:   "sidecar-bootstrap <workloadEntry>.<namespace>",
@@ -581,15 +589,16 @@ Istio will be started on the host network as a docker container in capture mode.
 			return nil
 		},
 		RunE: func(c *cobra.Command, args []string) error {
-			var configClient istioclient.Interface
+//			var configClient istioclient.Interface
 			var err error
 
-			if configClient, err = configStoreFactory(); err != nil {
-				return err
-			}
+			//if configClient, err = configStoreFactory(); err != nil {
+			//	return err
+			//}
 
-			var entries []clientnetworking.WorkloadEntry
-			var chosenNS string
+			//var entries []clientnetworking.WorkloadEntry
+			//var chosenNS string
+            /*
 			if all {
 				entries, chosenNS, err = fetchAllWorkloadEntries(configClient)
 			} else {
@@ -598,12 +607,59 @@ Istio will be started on the host network as a docker container in capture mode.
 			if err != nil {
 				return err
 			}
+*/
 
+// The following params must come from command line
+    //ipaddress := "10.128.0.27"
+    vmns := "test-ns"
+    //vmsa := "test-sa"
+
+	var callback ssh.HostKeyCallback
+	if sshIgnoreHostKeys {
+		callback = ssh.InsecureIgnoreHostKey()
+	} else {
+		user, err := user.Current()
+		if err != nil {
+			return err
+		}
+		callback, err = knownhosts.New(path.Join(user.HomeDir, ".ssh", "known_hosts"))
+		if err != nil {
+			return err
+		}
+	}
+            vm := &vm.VM{SshConfig: &vm.VMsshConfig{
+    Address: "10.128.0.27",
+    SshUser: sshUser,
+    SshAuthMethod:   sshAuthMethod,
+    HostKeyCallback: callback,
+    SshPort: sshPort,
+},
+}
+
+            err = vm.Connect()
+			if err != nil {
+				return err
+			}
+
+            err = vm.ExecuteCommand("touch vm-testing.txt")
+			if err != nil {
+				return err
+			}
+
+            // K8s specific operations:
+            // - check is ns exists, if not create ns
+            // - check if service account exists, if not create sa
+            // - create a token
 			kubeClient, err := interfaceFactory(kubeconfig)
 			if err != nil {
 				return err
 			}
 
+            _, err = vmCreateNamespace(kubeClient, vmns)
+			if err != nil {
+				return err
+			}
+/*
 			certs, err := getCertificate(kubeClient)
 			if err != nil {
 				return err
@@ -625,7 +681,7 @@ Istio will be started on the host network as a docker container in capture mode.
 					return err
 				}
 			}
-
+*/
 			return nil
 		},
 	}
