@@ -38,6 +38,8 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/crypto/ssh/terminal"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    authenticationv1 "k8s.io/api/authentication/v1"
+    k8errors "k8s.io/apimachinery/pkg/api/errors"
     "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 
@@ -530,9 +532,54 @@ func deriveSSHMethod() error {
 
 
 func vmCreateNamespace(kubeClient kubernetes.Interface, namespace string) (*v1.Namespace, error) {
-    nsSpec := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
-    return kubeClient.CoreV1().Namespaces().Create(context.TODO(), nsSpec, metav1.CreateOptions{})
+    // First check if the namespace exists
+    ns, err := kubeClient.CoreV1().Namespaces().Get(context.TODO(), namespace, metav1.GetOptions{})
+    if err != nil {
+        if k8errors.IsNotFound(err) {
+          nsSpec := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+          return kubeClient.CoreV1().Namespaces().Create(context.TODO(), nsSpec, metav1.CreateOptions{})
+        }
+    }
+    return ns, nil
 }
+
+/*
+func vmCreateServiceAccount(kubeClient kubernetes.Interface, namespace string, serviceaccount string) {
+}
+*/
+
+func createServiceAccountToken(kubeClient kubernetes.Interface, namespace string) (string, error) {
+       var seconds int64 = 3600
+       token, err := kubeClient.CoreV1().ServiceAccounts(namespace).CreateToken(context.TODO(), "default", 
+       &authenticationv1.TokenRequest{
+               Spec: authenticationv1.TokenRequestSpec{
+                           Audiences: []string {"istio-ca"},
+                           ExpirationSeconds:  &seconds,
+                   },
+                               },metav1.CreateOptions{})
+       if err != nil {
+              fmt.Print(token)
+              return "", err
+       }
+              fmt.Print(token.Status)
+       return token.Status.Token, nil
+}
+
+func getIstioRootCertificate(kubeClient kubernetes.Interface) (string, error) {
+  cm, err := kubeClient.CoreV1().ConfigMaps("istio-system").Get(context.TODO(), "istio-ca-root-cert", metav1.GetOptions{})
+  if err != nil {
+    return "", err
+  }
+
+  // Check if root-cert.pem is in the config map.
+  cert, found := cm.Data["root-cert.pem"]
+  if !found {
+    return "", fmt.Errorf("Cannot obtain istio root certificate from istio-ca-root-cert ConfigMap") 
+  }
+  fmt.Print(cert)
+  return cert, nil
+}
+
 
 func vmBootstrapCommand() *cobra.Command {
 	vmBSCommand := &cobra.Command{
@@ -612,6 +659,10 @@ Istio will be started on the host network as a docker container in capture mode.
 // The following params must come from command line
     //ipaddress := "10.128.0.27"
     vmns := "test-ns"
+    //ipaddress := "35.222.203.238"
+    ipaddress := "35.238.102.245"
+    ingress := "34.122.134.160"
+    vmname := "name-vm"
     //vmsa := "test-sa"
 
 	var callback ssh.HostKeyCallback
@@ -628,7 +679,8 @@ Istio will be started on the host network as a docker container in capture mode.
 		}
 	}
             vm := &vm.VM{SshConfig: &vm.VMsshConfig{
-    Address: "10.128.0.27",
+    //Address: "10.128.0.27",
+    Address: ipaddress,
     SshUser: sshUser,
     SshAuthMethod:   sshAuthMethod,
     HostKeyCallback: callback,
@@ -637,11 +689,6 @@ Istio will be started on the host network as a docker container in capture mode.
 }
 
             err = vm.Connect()
-			if err != nil {
-				return err
-			}
-
-            err = vm.ExecuteCommand("touch vm-testing.txt")
 			if err != nil {
 				return err
 			}
@@ -659,6 +706,115 @@ Istio will be started on the host network as a docker container in capture mode.
 			if err != nil {
 				return err
 			}
+
+            token, err := createServiceAccountToken(kubeClient, vmns)
+			if err != nil {
+				return err
+			}
+
+            cert, err := getIstioRootCertificate(kubeClient)
+			if err != nil {
+				return err
+			}
+
+            err = vm.ExecuteCommand("sudo mkdir -p /var/run/secrets/istio/")
+			if err != nil {
+				return err
+			}
+
+            err = vm.ExecuteCommand("sudo tee /var/run/secrets/istio/root-cert.pem << EOF\n" + cert + "EOF")
+			if err != nil {
+				return err
+			}
+
+            err = vm.ExecuteCommand("sudo mkdir -p /var/run/secrets/tokens/")
+			if err != nil {
+				return err
+			}
+
+            err = vm.ExecuteCommand("sudo tee /var/run/secrets/tokens/istio-token << EOF\n" + token + "\nEOF")
+			if err != nil {
+				return err
+			}
+            err = vm.ExecuteCommand("sudo  truncate -s -1 /var/run/secrets/tokens/istio-token")
+			if err != nil {
+				return err
+			}
+
+            // Download istio sidecar package
+            err = vm.ExecuteCommand("sudo apt update; sudo apt upgrade -y")
+			if err != nil {
+				return err
+			}
+            err = vm.ExecuteCommand("curl -LO https://storage.googleapis.com/istio-release/releases/1.7.2/deb/istio-sidecar.deb; sudo dpkg -i istio-sidecar.deb")
+			if err != nil {
+				return err
+            }
+
+            err = vm.ExecuteCommand("sudo mkdir -p /var/lib/istio/envoy/")
+			if err != nil {
+				return err
+			}
+
+            err = vm.ExecuteCommand("sudo touch /var/lib/istio/envoy/cluster.env")
+			if err != nil {
+				return err
+			}
+
+            err = vm.ExecuteCommand("sudo touch /var/lib/istio/envoy/sidecar.env")
+			if err != nil {
+				return err
+			}
+
+
+            err = vm.ExecuteCommand("sudo tee /var/lib/istio/envoy/sidecar.env << EOF\nPROV_CERT=/var/run/secrets/istio\nEOF")
+			if err != nil {
+				return err
+			}
+
+            err = vm.ExecuteCommand("sudo tee -a /var/lib/istio/envoy/sidecar.env << EOF\nOUTPUT_CERTS=/var/run/secrets/istio\nEOF")
+			if err != nil {
+				return err
+			}
+
+            // Update hosts file for istio ingress
+            err = vm.ExecuteCommand("sudo tee -a /etc/hosts << EOF\n" + ingress + " istiod.istio-system.svc\nEOF")
+			if err != nil {
+				return err
+			}
+            err = vm.ExecuteCommand("sudo tee /var/run/secrets/istio/root-cert.pem << EOF\n" + cert + "EOF")
+			if err != nil {
+				return err
+			}
+
+
+            err = vm.ExecuteCommand("sudo mkdir -p /etc/istio/proxy")
+			if err != nil {
+				return err
+			}
+            err = vm.ExecuteCommand("sudo useradd istio-proxy; sudo chown -R istio-proxy /var/lib/istio /etc/istio/proxy  /var/run/secrets")
+			if err != nil {
+				return err
+			}
+
+            // Modify the systemd files to include env variables for namespace and pod name
+            err = vm.ExecuteCommand("sudo sed --in-place 's/\\[Service\\]$/\\[Service\\]\\nEnvironment=\"ISTIO_NAMESPACE=" + vmns + "\"\\nEnvironment=\"POD_NAME=" + vmname +"\"/' /lib/systemd/system/istio.service")
+			if err != nil {
+				return err
+			}
+
+            // start istio proxy
+            err = vm.ExecuteCommand("sudo systemctl start istio")
+			if err != nil {
+				return err
+            }
+/*
+*/
+
+
+
+//$ echo "OUTPUT_CERTS=/var/run/secrets/istio" >> "${WORK_DIR}"/sidecar.env
+
 /*
 			certs, err := getCertificate(kubeClient)
 			if err != nil {
