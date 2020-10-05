@@ -37,18 +37,18 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/crypto/ssh/terminal"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	"k8s.io/api/core/v1"
+	k8errors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-    authenticationv1 "k8s.io/api/authentication/v1"
-    k8errors "k8s.io/apimachinery/pkg/api/errors"
-    "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes"
 
 	clientnetworking "istio.io/client-go/pkg/apis/networking/v1alpha3"
 	istioclient "istio.io/client-go/pkg/clientset/versioned"
+	"istio.io/istio/istioctl/pkg/vm"
 	"istio.io/istio/pkg/spiffe"
 	"istio.io/istio/security/pkg/k8s/secret"
 	"istio.io/istio/security/pkg/pki/util"
-    "istio.io/istio/istioctl/pkg/vm"
 )
 
 var (
@@ -68,6 +68,12 @@ var (
 	sshPort           int
 	sshUser           string
 	startIstio        bool
+
+	// VM onboarding
+	vmip    string
+	vmname  string
+	vmns    string
+	ingress string
 )
 
 type workloadEntryAddressKeys struct {
@@ -530,17 +536,16 @@ func deriveSSHMethod() error {
 	return nil
 }
 
-
 func vmCreateNamespace(kubeClient kubernetes.Interface, namespace string) (*v1.Namespace, error) {
-    // First check if the namespace exists
-    ns, err := kubeClient.CoreV1().Namespaces().Get(context.TODO(), namespace, metav1.GetOptions{})
-    if err != nil {
-        if k8errors.IsNotFound(err) {
-          nsSpec := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
-          return kubeClient.CoreV1().Namespaces().Create(context.TODO(), nsSpec, metav1.CreateOptions{})
-        }
-    }
-    return ns, nil
+	// First check if the namespace exists
+	ns, err := kubeClient.CoreV1().Namespaces().Get(context.TODO(), namespace, metav1.GetOptions{})
+	if err != nil {
+		if k8errors.IsNotFound(err) {
+			nsSpec := &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+			return kubeClient.CoreV1().Namespaces().Create(context.TODO(), nsSpec, metav1.CreateOptions{})
+		}
+	}
+	return ns, nil
 }
 
 /*
@@ -549,37 +554,33 @@ func vmCreateServiceAccount(kubeClient kubernetes.Interface, namespace string, s
 */
 
 func createServiceAccountToken(kubeClient kubernetes.Interface, namespace string) (string, error) {
-       var seconds int64 = 3600
-       token, err := kubeClient.CoreV1().ServiceAccounts(namespace).CreateToken(context.TODO(), "default", 
-       &authenticationv1.TokenRequest{
-               Spec: authenticationv1.TokenRequestSpec{
-                           Audiences: []string {"istio-ca"},
-                           ExpirationSeconds:  &seconds,
-                   },
-                               },metav1.CreateOptions{})
-       if err != nil {
-              fmt.Print(token)
-              return "", err
-       }
-              fmt.Print(token.Status)
-       return token.Status.Token, nil
+	var seconds int64 = 3600
+	token, err := kubeClient.CoreV1().ServiceAccounts(namespace).CreateToken(context.TODO(), "default",
+		&authenticationv1.TokenRequest{
+			Spec: authenticationv1.TokenRequestSpec{
+				Audiences:         []string{"istio-ca"},
+				ExpirationSeconds: &seconds,
+			},
+		}, metav1.CreateOptions{})
+	if err != nil {
+		return "", err
+	}
+	return token.Status.Token, nil
 }
 
 func getIstioRootCertificate(kubeClient kubernetes.Interface) (string, error) {
-  cm, err := kubeClient.CoreV1().ConfigMaps("istio-system").Get(context.TODO(), "istio-ca-root-cert", metav1.GetOptions{})
-  if err != nil {
-    return "", err
-  }
+	cm, err := kubeClient.CoreV1().ConfigMaps("istio-system").Get(context.TODO(), "istio-ca-root-cert", metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
 
-  // Check if root-cert.pem is in the config map.
-  cert, found := cm.Data["root-cert.pem"]
-  if !found {
-    return "", fmt.Errorf("Cannot obtain istio root certificate from istio-ca-root-cert ConfigMap") 
-  }
-  fmt.Print(cert)
-  return cert, nil
+	// Check if root-cert.pem is in the config map.
+	cert, found := cm.Data["root-cert.pem"]
+	if !found {
+		return "", fmt.Errorf("Cannot obtain istio root certificate from istio-ca-root-cert ConfigMap")
+	}
+	return cert, nil
 }
-
 
 func vmBootstrapCommand() *cobra.Command {
 	vmBSCommand := &cobra.Command{
@@ -609,15 +610,8 @@ Istio will be started on the host network as a docker container in capture mode.
   # Generate Certs locally, but do not copy them to a WorkloadEntry named "we" in the "ns" namespace:
   istioctl x sidecar-bootstrap we.ns --local-dir path/where/i/want/certs/`,
 		Args: func(cmd *cobra.Command, args []string) error {
-			if (len(args) == 1) == all {
-				cmd.Println(cmd.UsageString())
-				return fmt.Errorf("sidecar-bootstrap requires a workload entry, or the --all flag")
-			}
-			if all && namespace == "" {
-				return fmt.Errorf("sidecar-bootstrap needs a namespace if fetching all workspaces")
-			}
-			if !startIstio && istioProxyImage != "istio/proxyv2:latest" {
-				return fmt.Errorf("sidecar-bootstrap received a non default IstioProxy image argument, but is not starting Istio")
+			if (len(vmip) == 0) || (len(vmns) == 0) || (len(vmname) == 0) || (len(ingress) == 0) {
+				return fmt.Errorf("vmip, vmname, vmns and ingress parameters are required.")
 			}
 			if sshUser == "" {
 				user, err := user.Current()
@@ -626,17 +620,15 @@ Istio will be started on the host network as a docker container in capture mode.
 				}
 				sshUser = user.Username
 			}
-			if dumpDir == "" {
-				err := deriveSSHMethod()
-				if err != nil {
-					return err
-				}
+			err := deriveSSHMethod()
+			if err != nil {
+				return err
 			}
 
 			return nil
 		},
 		RunE: func(c *cobra.Command, args []string) error {
-//			var configClient istioclient.Interface
+			//			var configClient istioclient.Interface
 			var err error
 
 			//if configClient, err = configStoreFactory(); err != nil {
@@ -645,223 +637,108 @@ Istio will be started on the host network as a docker container in capture mode.
 
 			//var entries []clientnetworking.WorkloadEntry
 			//var chosenNS string
-            /*
-			if all {
-				entries, chosenNS, err = fetchAllWorkloadEntries(configClient)
+			/*
+				if all {
+					entries, chosenNS, err = fetchAllWorkloadEntries(configClient)
+				} else {
+					entries, chosenNS, err = fetchSingleWorkloadEntry(args[0], configClient)
+				}
+				if err != nil {
+					return err
+				}
+			*/
+
+			var callback ssh.HostKeyCallback
+			if sshIgnoreHostKeys {
+				callback = ssh.InsecureIgnoreHostKey()
 			} else {
-				entries, chosenNS, err = fetchSingleWorkloadEntry(args[0], configClient)
+				user, err := user.Current()
+				if err != nil {
+					return err
+				}
+				callback, err = knownhosts.New(path.Join(user.HomeDir, ".ssh", "known_hosts"))
+				if err != nil {
+					return err
+				}
 			}
-			if err != nil {
-				return err
+			vmInstance := &vm.VM{SshConfig: &vm.VMsshConfig{
+				Address:         vmip,
+				SshUser:         sshUser,
+				SshAuthMethod:   sshAuthMethod,
+				HostKeyCallback: callback,
+				SshPort:         sshPort,
+			},
 			}
-*/
 
-// The following params must come from command line
-    //ipaddress := "10.128.0.27"
-    vmns := "test-ns"
-    //ipaddress := "35.222.203.238"
-    ipaddress := "35.238.102.245"
-    ingress := "34.122.134.160"
-    vmname := "name-vm"
-    //vmsa := "test-sa"
-
-	var callback ssh.HostKeyCallback
-	if sshIgnoreHostKeys {
-		callback = ssh.InsecureIgnoreHostKey()
-	} else {
-		user, err := user.Current()
-		if err != nil {
-			return err
-		}
-		callback, err = knownhosts.New(path.Join(user.HomeDir, ".ssh", "known_hosts"))
-		if err != nil {
-			return err
-		}
-	}
-            vm := &vm.VM{SshConfig: &vm.VMsshConfig{
-    //Address: "10.128.0.27",
-    Address: ipaddress,
-    SshUser: sshUser,
-    SshAuthMethod:   sshAuthMethod,
-    HostKeyCallback: callback,
-    SshPort: sshPort,
-},
-}
-
-            err = vm.Connect()
+			err = vmInstance.Connect()
 			if err != nil {
 				return err
 			}
 
-            // K8s specific operations:
-            // - check is ns exists, if not create ns
-            // - check if service account exists, if not create sa
-            // - create a token
+			// K8s specific operations:
+			// - check is ns exists, if not create ns
+			// - check if service account exists, if not create sa
+			// - create a token
 			kubeClient, err := interfaceFactory(kubeconfig)
 			if err != nil {
 				return err
 			}
 
-            _, err = vmCreateNamespace(kubeClient, vmns)
+			_, err = vmCreateNamespace(kubeClient, vmns)
 			if err != nil {
 				return err
 			}
 
-            token, err := createServiceAccountToken(kubeClient, vmns)
+			token, err := createServiceAccountToken(kubeClient, vmns)
 			if err != nil {
 				return err
 			}
 
-            cert, err := getIstioRootCertificate(kubeClient)
+			cert, err := getIstioRootCertificate(kubeClient)
 			if err != nil {
 				return err
 			}
 
-            err = vm.ExecuteCommand("sudo mkdir -p /var/run/secrets/istio/")
+			// Define actions to be executed on the VM.
+			vmActions := []vm.SshAction{{"Creating directories for secrets", "sudo mkdir -p /var/run/secrets/istio/"},
+				{"", "sudo tee /var/run/secrets/istio/root-cert.pem << EOF\n" + cert + "EOF"},
+				{"", "sudo mkdir -p /var/run/secrets/tokens/"},
+				{"", "sudo tee /var/run/secrets/tokens/istio-token << EOF\n" + token + "\nEOF"},
+				{"", "sudo  truncate -s -1 /var/run/secrets/tokens/istio-token"},
+
+				{"Downloading istio sidecar package", "sudo apt update; sudo apt upgrade -y"},
+				{"", "curl -LO https://storage.googleapis.com/istio-release/releases/1.7.2/deb/istio-sidecar.deb; sudo dpkg -i istio-sidecar.deb"},
+
+				{"Creating proxy config files", "sudo mkdir -p /var/lib/istio/envoy/"},
+				{"", "sudo touch /var/lib/istio/envoy/cluster.env"},
+				{"", "sudo touch /var/lib/istio/envoy/sidecar.env"},
+				{"", "sudo tee /var/lib/istio/envoy/sidecar.env << EOF\nPROV_CERT=/var/run/secrets/istio\nEOF"},
+				{"", "sudo tee -a /var/lib/istio/envoy/sidecar.env << EOF\nOUTPUT_CERTS=/var/run/secrets/istio\nEOF"},
+				// Update hosts file for istio ingress
+				{"", "sudo tee -a /etc/hosts << EOF\n" + ingress + " istiod.istio-system.svc\nEOF"},
+				{"", "sudo tee /var/run/secrets/istio/root-cert.pem << EOF\n" + cert + "EOF"},
+				{"", "sudo mkdir -p /etc/istio/proxy"},
+				{"", "sudo useradd istio-proxy; sudo chown -R istio-proxy /var/lib/istio /etc/istio/proxy  /var/run/secrets"},
+				// Modify the systemd files to include env variables for namespace and pod name
+				{"", "sudo sed --in-place 's/\\[Service\\]$/\\[Service\\]\\nEnvironment=\"ISTIO_NAMESPACE=" + vmns + "\"\\nEnvironment=\"POD_NAME=" + vmname + "\"/' /lib/systemd/system/istio.service"},
+				// start istio proxy
+				{"Starting proxy", "sudo systemctl start istio"},
+			}
+			index, err := vmInstance.ExecuteManySSHCommands(&vmActions)
 			if err != nil {
+				fmt.Print("Command %s failed", vmActions[index])
 				return err
 			}
 
-            err = vm.ExecuteCommand("sudo tee /var/run/secrets/istio/root-cert.pem << EOF\n" + cert + "EOF")
-			if err != nil {
-				return err
-			}
-
-            err = vm.ExecuteCommand("sudo mkdir -p /var/run/secrets/tokens/")
-			if err != nil {
-				return err
-			}
-
-            err = vm.ExecuteCommand("sudo tee /var/run/secrets/tokens/istio-token << EOF\n" + token + "\nEOF")
-			if err != nil {
-				return err
-			}
-            err = vm.ExecuteCommand("sudo  truncate -s -1 /var/run/secrets/tokens/istio-token")
-			if err != nil {
-				return err
-			}
-
-            // Download istio sidecar package
-            err = vm.ExecuteCommand("sudo apt update; sudo apt upgrade -y")
-			if err != nil {
-				return err
-			}
-            err = vm.ExecuteCommand("curl -LO https://storage.googleapis.com/istio-release/releases/1.7.2/deb/istio-sidecar.deb; sudo dpkg -i istio-sidecar.deb")
-			if err != nil {
-				return err
-            }
-
-            err = vm.ExecuteCommand("sudo mkdir -p /var/lib/istio/envoy/")
-			if err != nil {
-				return err
-			}
-
-            err = vm.ExecuteCommand("sudo touch /var/lib/istio/envoy/cluster.env")
-			if err != nil {
-				return err
-			}
-
-            err = vm.ExecuteCommand("sudo touch /var/lib/istio/envoy/sidecar.env")
-			if err != nil {
-				return err
-			}
-
-
-            err = vm.ExecuteCommand("sudo tee /var/lib/istio/envoy/sidecar.env << EOF\nPROV_CERT=/var/run/secrets/istio\nEOF")
-			if err != nil {
-				return err
-			}
-
-            err = vm.ExecuteCommand("sudo tee -a /var/lib/istio/envoy/sidecar.env << EOF\nOUTPUT_CERTS=/var/run/secrets/istio\nEOF")
-			if err != nil {
-				return err
-			}
-
-            // Update hosts file for istio ingress
-            err = vm.ExecuteCommand("sudo tee -a /etc/hosts << EOF\n" + ingress + " istiod.istio-system.svc\nEOF")
-			if err != nil {
-				return err
-			}
-            err = vm.ExecuteCommand("sudo tee /var/run/secrets/istio/root-cert.pem << EOF\n" + cert + "EOF")
-			if err != nil {
-				return err
-			}
-
-
-            err = vm.ExecuteCommand("sudo mkdir -p /etc/istio/proxy")
-			if err != nil {
-				return err
-			}
-            err = vm.ExecuteCommand("sudo useradd istio-proxy; sudo chown -R istio-proxy /var/lib/istio /etc/istio/proxy  /var/run/secrets")
-			if err != nil {
-				return err
-			}
-
-            // Modify the systemd files to include env variables for namespace and pod name
-            err = vm.ExecuteCommand("sudo sed --in-place 's/\\[Service\\]$/\\[Service\\]\\nEnvironment=\"ISTIO_NAMESPACE=" + vmns + "\"\\nEnvironment=\"POD_NAME=" + vmname +"\"/' /lib/systemd/system/istio.service")
-			if err != nil {
-				return err
-			}
-
-            // start istio proxy
-            err = vm.ExecuteCommand("sudo systemctl start istio")
-			if err != nil {
-				return err
-            }
-/*
-*/
-
-
-
-//$ echo "OUTPUT_CERTS=/var/run/secrets/istio" >> "${WORK_DIR}"/sidecar.env
-
-/*
-			certs, err := getCertificate(kubeClient)
-			if err != nil {
-				return err
-			}
-
-			addresses, err := getCertificatesForEachAddress(entries, chosenNS, certs)
-			if err != nil {
-				return err
-			}
-
-			if dumpDir != "" {
-				err = dumpCertificates(dumpDir, addresses)
-				if err != nil {
-					return err
-				}
-			} else {
-				err = copyCertificates(kubeClient, addresses)
-				if err != nil {
-					return err
-				}
-			}
-*/
 			return nil
 		},
 	}
 
-	vmBSCommand.PersistentFlags().BoolVarP(&all, "all", "a", false,
-		"Attempt to bootstrap all workload entries")
-	vmBSCommand.PersistentFlags().DurationVar(&certDuration, "duration", 365*24*time.Hour,
-		"(experimental) Duration the certificates generated are valid for.")
-	vmBSCommand.PersistentFlags().StringVarP(&dumpDir, "local-dir", "d", "",
-		"Directory to place certs in locally as opposed to copying")
-	vmBSCommand.PersistentFlags().StringVar(&istioProxyImage, "istio-image", "istio/proxyv2:latest",
-		"(experimental) The Istio proxy image to start up when starting Istio")
-	vmBSCommand.PersistentFlags().BoolVar(&mutualTLS, "mutual-tls", false,
-		"(experimental) Enable mutual TLS if starting Istio-Proxy.")
-	vmBSCommand.PersistentFlags().StringVarP(&organization, "organization", "o", "",
-		"(experimental) The organization to use on the certificate, defaults to the same as the root cert.")
-	vmBSCommand.PersistentFlags().StringVar(&remoteDirectory, "remote-directory", "/var/run/istio",
-		"(experimental) The directory to create on the remote machine.")
-	vmBSCommand.PersistentFlags().StringVar(&scpPath, "remote-scp-path", "/usr/bin/scp",
-		"(experimental) The scp binary location on the target machine if not at /usr/bin/scp")
-	vmBSCommand.PersistentFlags().DurationVar(&scpTimeout, "timeout", 60*time.Second,
-		"(experimental) The timeout for copying certificates")
-	vmBSCommand.PersistentFlags().StringVar(&spiffeTrustDomain, "spiffe-trust-domain", "",
-		"(experimental) The SPIFFE trust domain for the generated certs")
+	vmBSCommand.PersistentFlags().StringVar(&vmip, "vmip", "", "IP address of VM")
+	vmBSCommand.PersistentFlags().StringVar(&vmname, "vmname", "", "Name to assign to the VM")
+	vmBSCommand.PersistentFlags().StringVar(&vmns, "vmns", "", "Kubernetes namespace where VM will be created")
+	vmBSCommand.PersistentFlags().StringVar(&ingress, "ingress", "", "IP address of Kubernetes ingress")
+
 	vmBSCommand.PersistentFlags().BoolVar(&sshIgnoreHostKeys, "ignore-host-keys", false,
 		"(experimental) Ignore host keys on the remote host")
 	vmBSCommand.PersistentFlags().StringVarP(&sshKeyLocation, "ssh-key", "k", "",
@@ -870,8 +747,31 @@ Istio will be started on the host network as a docker container in capture mode.
 		"(experimental) The port to SSH to the machine on")
 	vmBSCommand.PersistentFlags().StringVarP(&sshUser, "ssh-user", "u", "",
 		"(experimental) The user to SSH as, defaults to the current user")
-	vmBSCommand.PersistentFlags().BoolVar(&startIstio, "start-istio-proxy", false,
-		"Start Istio proxy on a remote host after copying certs")
+
+	/*
+		vmBSCommand.PersistentFlags().BoolVarP(&all, "all", "a", false,
+			"Attempt to bootstrap all workload entries")
+		vmBSCommand.PersistentFlags().DurationVar(&certDuration, "duration", 365*24*time.Hour,
+			"(experimental) Duration the certificates generated are valid for.")
+		vmBSCommand.PersistentFlags().StringVarP(&dumpDir, "local-dir", "d", "",
+			"Directory to place certs in locally as opposed to copying")
+		vmBSCommand.PersistentFlags().StringVar(&istioProxyImage, "istio-image", "istio/proxyv2:latest",
+			"(experimental) The Istio proxy image to start up when starting Istio")
+		vmBSCommand.PersistentFlags().BoolVar(&mutualTLS, "mutual-tls", false,
+			"(experimental) Enable mutual TLS if starting Istio-Proxy.")
+		vmBSCommand.PersistentFlags().StringVarP(&organization, "organization", "o", "",
+			"(experimental) The organization to use on the certificate, defaults to the same as the root cert.")
+		vmBSCommand.PersistentFlags().StringVar(&remoteDirectory, "remote-directory", "/var/run/istio",
+			"(experimental) The directory to create on the remote machine.")
+		vmBSCommand.PersistentFlags().StringVar(&scpPath, "remote-scp-path", "/usr/bin/scp",
+			"(experimental) The scp binary location on the target machine if not at /usr/bin/scp")
+		vmBSCommand.PersistentFlags().DurationVar(&scpTimeout, "timeout", 60*time.Second,
+			"(experimental) The timeout for copying certificates")
+		vmBSCommand.PersistentFlags().StringVar(&spiffeTrustDomain, "spiffe-trust-domain", "",
+			"(experimental) The SPIFFE trust domain for the generated certs")
+		vmBSCommand.PersistentFlags().BoolVar(&startIstio, "start-istio-proxy", false,
+			"Start Istio proxy on a remote host after copying certs")
+	*/
 
 	return vmBSCommand
 }
